@@ -13,7 +13,10 @@ set(SOURCES
     src/sdr/TestSignalGenerator.cpp
     src/dsp/Fft.cpp
     src/dsp/SpectrumEngine.cpp
+    src/dsp/SpectrumSweepEngine.cpp
     src/dsp/AnalogTvDemod.cpp
+    src/dsp/AmFmDemod.cpp
+    src/audio/AudioOutput.cpp
     src/ui/MainWindow.cpp
 
     # Dear ImGui Core
@@ -68,6 +71,7 @@ if(APPLE)
         "-framework Cocoa"
         "-framework IOKit"
         "-framework CoreVideo"
+        "-framework AudioToolbox"
     )
 elseif(UNIX AND NOT APPLE)
     # Linux (Raspberry Pi 4 / Debian)

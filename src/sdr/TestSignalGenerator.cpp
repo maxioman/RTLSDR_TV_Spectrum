@@ -289,6 +289,94 @@ void TestSignalGenerator::generatorThreadLoop() {
 
     while (!shouldStop_) {
         double sRate = static_cast<double>(config_.sampleRateHz);
+        double centerHz = static_cast<double>(config_.frequencyHz);
+
+        // Check if tuned to AM/FM/Ham/ISM bands (outside VHF/UHF Analog TV presets)
+        bool isAmFmBand =
+            (centerHz >= 87.5e6 && centerHz <= 108.5e6) ||
+            (centerHz >= 117.5e6 && centerHz <= 137.5e6) ||
+            (centerHz >= 143.5e6 && centerHz <= 148.5e6) ||
+            (centerHz >= 429.5e6 && centerHz <= 440.5e6);
+
+        if (isAmFmBand) {
+            struct SimStation {
+                double freqHz;
+                int mode; // 0: AM, 1: NFM, 2: WFM
+                float toneHz;
+                float amp;
+            };
+            static const SimStation kStations[] = {
+                {  90.50e6, 2,  440.0f, 0.55f },
+                {  94.20e6, 2,  587.3f, 0.60f },
+                {  98.00e6, 2,  659.2f, 0.70f },
+                { 101.50e6, 2,  880.0f, 0.65f },
+                { 105.70e6, 2,  523.2f, 0.50f },
+                { 121.50e6, 0, 1000.0f, 0.55f },
+                { 128.00e6, 0,  800.0f, 0.65f },
+                { 133.40e6, 0,  440.0f, 0.50f },
+                { 145.50e6, 1,  600.0f, 0.65f },
+                { 146.80e6, 1, 1000.0f, 0.55f },
+                { 433.92e6, 1, 1200.0f, 0.65f },
+                { 438.50e6, 1,  750.0f, 0.55f },
+            };
+
+            const float curNoiseLvl = noiseLevel_.load();
+            for (size_t i = 0; i < BLOCK_SAMPLES; ++i) {
+                double t = static_cast<double>(sampleIndex_) / sRate;
+                float sumI = 0.0f;
+                float sumQ = 0.0f;
+
+                for (const auto& st : kStations) {
+                    double offset = st.freqHz - centerHz;
+                    if (std::abs(offset) > sRate * 0.46) continue;
+
+                    double carrierPhase = 2.0 * M_PI * offset * t;
+                    float modSig = std::sin(2.0f * static_cast<float>(M_PI) * st.toneHz * static_cast<float>(t));
+
+                    if (st.mode == 0) {
+                        // AM: (1 + 0.7 * m(t)) * exp(j * 2*pi*offset*t)
+                        float env = st.amp * (1.0f + 0.7f * modSig);
+                        sumI += env * static_cast<float>(std::cos(carrierPhase));
+                        sumQ += env * static_cast<float>(std::sin(carrierPhase));
+                    } else {
+                        // FM (WFM: 55 kHz dev, NFM: 4 kHz dev)
+                        float devHz = (st.mode == 2) ? 55000.0f : 4000.0f;
+                        double fmPhase = -(devHz / st.toneHz) * std::cos(2.0 * M_PI * st.toneHz * t);
+                        double totalPhase = carrierPhase + fmPhase;
+                        sumI += st.amp * static_cast<float>(std::cos(totalPhase));
+                        sumQ += st.amp * static_cast<float>(std::sin(totalPhase));
+                    }
+                }
+
+                float nI = ((static_cast<float>(std::rand() % 2000) / 1000.0f) - 1.0f) * curNoiseLvl;
+                float nQ = ((static_cast<float>(std::rand() % 2000) / 1000.0f) - 1.0f) * curNoiseLvl;
+
+                int sampleI = std::max(0, std::min(255, static_cast<int>(127.5f + (sumI + nI) * 90.0f)));
+                int sampleQ = std::max(0, std::min(255, static_cast<int>(127.5f + (sumQ + nQ) * 90.0f)));
+
+                iqBuffer[i * 2 + 0] = static_cast<uint8_t>(sampleI);
+                iqBuffer[i * 2 + 1] = static_cast<uint8_t>(sampleQ);
+                sampleIndex_++;
+            }
+
+            if (callback_) {
+                callback_(iqBuffer.data(), iqBuffer.size());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(statsMutex_);
+                stats_.bytesReceived += iqBuffer.size();
+                stats_.currentKBytesPerSec = static_cast<float>(sRate * 2.0) / 1024.0f;
+            }
+
+            double blockDurationSec = static_cast<double>(BLOCK_SAMPLES) / sRate;
+            nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(blockDurationSec)
+            );
+            std::this_thread::sleep_until(nextTick);
+            continue;
+        }
+
         double samplesPerLine = sRate / lineRate;
 
         for (size_t i = 0; i < BLOCK_SAMPLES; ++i) {

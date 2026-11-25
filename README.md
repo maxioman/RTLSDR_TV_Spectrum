@@ -22,10 +22,15 @@ A cross-platform C++17 application for **macOS** and **Raspberry Pi 4** (`aarch6
 - **Real-time Radix-2 FFT**: Configurable FFT power spectrum with Max Hold, exponential averaging, peak tracking, and noise-floor readout.
 - **2D Waterfall Spectrogram**: Scrolling GPU-textured spectrogram with **Turbo**, **Viridis**, **Plasma**, and **Fire** color palettes.
 
-### 3. Flexible SDR Input Sources
+### 3. AM / FM Wideband Spectrum Sweep & Demodulator
+- **Stepped Wideband Sweep**: Scans across any configured `[Start, Stop]` MHz span, stitching FFT segments into a unified spectrum trace and 2D waterfall with Max Hold and click-to-tune.
+- **Band Presets**: FM Broadcast (88–108 MHz), Airband AM (118–137 MHz), 2m Ham NFM (144–148 MHz), and 70cm / ISM (430–440 MHz).
+- **Real-Time AM / NFM / WFM Demodulation**: Cascaded I/Q channel filtering, quadrature FM discriminator (with selectable 50 µs / 75 µs de-emphasis) and envelope AM demodulator with AGC, squelch, live RSSI meter, AF audio oscilloscope, and 48 kHz cross-platform audio playback (`AudioToolbox` on macOS, `ALSA` on Linux).
+
+### 4. Flexible SDR Input Sources
 - **Network Streaming (`rtl_tcp`)**: Connects over TCP to a remote Raspberry Pi or host running `rtl_tcp`.
 - **Local USB RTL-SDR**: Direct `librtlsdr` support when compiled with `librtlsdr` installed.
-- **Synthetic Test Pattern Generator**: Built-in RF I/Q generator with **PM5544 Testcard**, **EBU Colorbars**, and **Custom BMP Image** (`test_pattern.bmp`) modes plus adjustable RF noise for offline testing.
+- **Synthetic Test Pattern Generator**: Built-in RF I/Q generator with **PM5544 Testcard**, **EBU Colorbars**, and **Custom BMP Image** (`test_pattern.bmp`) modes, plus simulated WFM/AM/NFM stations in the FM/Airband/Ham/ISM bands for offline testing.
 
 ---
 
@@ -123,8 +128,9 @@ To sync the source tree and build natively on a Raspberry Pi 4 over SSH, update 
 ├── src/
 │   ├── main.cpp                 # GLFW / OpenGL3 / Dear ImGui entry point
 │   ├── sdr/                     # ISdrDevice, RtlTcpClient, RtlUsbDevice, TestSignalGenerator
-│   ├── dsp/                     # FastFft, SpectrumEngine, AnalogTvDemod
-│   └── ui/                      # MainWindow (TV viewer, spectrum, waterfall, diagnostics)
+│   ├── dsp/                     # FastFft, SpectrumEngine, SpectrumSweepEngine, AnalogTvDemod, AmFmDemod
+│   ├── audio/                   # Cross-platform 48 kHz AudioOutput (AudioToolbox / ALSA)
+│   └── ui/                      # MainWindow (TV viewer, spectrum, AM/FM sweep & demod, diagnostics)
 ├── vendor/
 │   ├── imgui/                   # Dear ImGui
 │   ├── implot/                  # ImPlot

@@ -19,6 +19,7 @@ namespace RTLSDR {
 
 MainWindow::MainWindow()
     : spectrumEngine_(1024, 256)
+    , sweepEngine_(1024, 180)
 {
     // Initialize default SDR device to test generator initially
     sdrDevice_ = std::make_unique<TestSignalGenerator>();
@@ -32,6 +33,8 @@ MainWindow::MainWindow()
 }
 
 MainWindow::~MainWindow() {
+    sweepEngine_.stopSweep();
+    audioOutput_.close();
     disconnectDevice();
     if (tvTextureId_ != 0) {
         glDeleteTextures(1, &tvTextureId_);
@@ -41,12 +44,24 @@ MainWindow::~MainWindow() {
         glDeleteTextures(1, &waterfallTextureId_);
         waterfallTextureId_ = 0;
     }
+    if (sweepWaterfallTextureId_ != 0) {
+        glDeleteTextures(1, &sweepWaterfallTextureId_);
+        sweepWaterfallTextureId_ = 0;
+    }
 }
 
 void MainWindow::handleSdrSamples(const uint8_t* data, size_t length) {
-    // Feed samples simultaneously to Spectrum Engine and Analog TV Demodulator
-    spectrumEngine_.pushIqBytes(data, length, static_cast<double>(config_.frequencyHz), static_cast<double>(config_.sampleRateHz));
-    tvDemod_.processIqBytes(data, length);
+    // Feed samples to Spectrum Engine, Sweep Engine, TV Demod, and AM/FM Demod
+    double centerHz = static_cast<double>(config_.frequencyHz);
+    double sRateHz = static_cast<double>(config_.sampleRateHz);
+
+    spectrumEngine_.pushIqBytes(data, length, centerHz, sRateHz);
+    if (sweepEngine_.isActive()) {
+        sweepEngine_.pushIqBytes(data, length, centerHz, sRateHz);
+    } else {
+        tvDemod_.processIqBytes(data, length);
+        amFmDemod_.processIqBytes(data, length, centerHz, sRateHz);
+    }
 }
 
 void MainWindow::connectDevice() {
@@ -90,13 +105,53 @@ void MainWindow::disconnectDevice() {
 void MainWindow::tuneToFrequency(uint32_t freqHz) {
     config_.frequencyHz = freqHz;
     centerFreqMHz_ = static_cast<double>(freqHz) / 1e6;
+    demodTargetFreqMHz_ = centerFreqMHz_;
+    auto amCfg = amFmDemod_.getConfig();
+    amCfg.channelOffsetHz = 0.0;
+    amFmDemod_.setConfig(amCfg);
     tvDemod_.clearFrame();
     if (sdrDevice_ && sdrDevice_->isRunning()) {
         sdrDevice_->setFrequency(freqHz);
     }
 }
 
+void MainWindow::pumpAudio() {
+    bool wantAmFmAudio = amFmDemod_.getConfig().audioEnabled && !sweepEngine_.isActive();
+    bool wantTvAudio = tvDemod_.getConfig().audioEnabled && !wantAmFmAudio && !sweepEngine_.isActive();
+
+    if (wantAmFmAudio || wantTvAudio) {
+        if (!audioOutput_.isOpen()) {
+            audioDeviceOpened_ = audioOutput_.open(48000);
+        }
+        if (audioOutput_.isOpen()) {
+            float pcm[4096];
+            size_t got = wantAmFmAudio
+                ? amFmDemod_.getAudioSamples(pcm, 4096)
+                : tvDemod_.getAudioSamples(pcm, 4096);
+            if (got > 0) {
+                audioOutput_.pushSamples(pcm, got);
+            }
+        }
+    } else if (audioOutput_.isOpen()) {
+        audioOutput_.close();
+        audioDeviceOpened_ = false;
+    }
+}
+
 void MainWindow::render() {
+    // Step wideband sweep if active
+    uint32_t nextSweepFreqHz = 0;
+    if (sweepEngine_.pollNextTuneFreq(static_cast<double>(config_.sampleRateHz), nextSweepFreqHz)) {
+        config_.frequencyHz = nextSweepFreqHz;
+        centerFreqMHz_ = static_cast<double>(nextSweepFreqHz) / 1e6;
+        if (sdrDevice_ && sdrDevice_->isRunning()) {
+            sdrDevice_->setFrequency(nextSweepFreqHz);
+        }
+        sweepEngine_.notifyTuned(nextSweepFreqHz);
+    }
+
+    pumpAudio();
+
     renderTopBar();
 
     ImGui::Separator();
@@ -109,6 +164,10 @@ void MainWindow::render() {
         }
         if (ImGui::BeginTabItem("📊 VHF / UHF Spectrum & Waterfall")) {
             renderSpectrumTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("📻 AM/FM Sweep & Demod")) {
+            renderAmFmSweepTab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("⚙️ SDR Diagnostics & rtl_tcp")) {
@@ -669,6 +728,320 @@ void MainWindow::renderSpectrumTab() {
     if (ImGui::Button("UHF TV (550M)"))       tuneToFrequency(550000000);
     ImGui::SameLine();
     if (ImGui::Button("LTE-800 (806M)"))       tuneToFrequency(806000000);
+}
+
+void MainWindow::renderAmFmSweepTab() {
+    SweepSnapshot sweepSnap;
+    bool hasSweep = sweepEngine_.getSnapshot(sweepSnap);
+    bool sweeping = sweepEngine_.isActive();
+
+    // Top Sweep Control Strip
+    ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "WIDEBAND SWEEP:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(85.0f);
+    bool rangeEdited = ImGui::InputDouble("Start (MHz)", &sweepStartMHz_, 0.0, 0.0, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(85.0f);
+    rangeEdited |= ImGui::InputDouble("Stop (MHz)", &sweepStopMHz_, 0.0, 0.0, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(65.0f);
+    rangeEdited |= ImGui::InputInt("Dwell (ms)", &sweepDwellMs_, 0, 0);
+
+    sweepStartMHz_ = std::max(24.0, std::min(1760.0, sweepStartMHz_));
+    sweepStopMHz_ = std::max(sweepStartMHz_ + 1.0, std::min(1766.0, sweepStopMHz_));
+    sweepDwellMs_ = std::max(15, std::min(500, sweepDwellMs_));
+
+    if (rangeEdited) {
+        SweepConfig sc = sweepEngine_.getConfig();
+        sc.startFreqMHz = sweepStartMHz_;
+        sc.stopFreqMHz = sweepStopMHz_;
+        sc.dwellTimeMs = sweepDwellMs_;
+        sweepEngine_.configure(sc);
+    }
+
+    ImGui::SameLine();
+    if (!sweeping) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.55f, 0.25f, 1.0f));
+        if (ImGui::Button("START SWEEP")) {
+            SweepConfig sc = sweepEngine_.getConfig();
+            sc.startFreqMHz = sweepStartMHz_;
+            sc.stopFreqMHz = sweepStopMHz_;
+            sc.dwellTimeMs = sweepDwellMs_;
+            sweepEngine_.configure(sc);
+            sweepEngine_.startSweep();
+        }
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
+        if (ImGui::Button("STOP SWEEP")) {
+            sweepEngine_.stopSweep();
+            tuneToFrequency(static_cast<uint32_t>(std::round(demodTargetFreqMHz_ * 1e6)));
+        }
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Max Hold##Sweep")) {
+        sweepEngine_.resetMaxHold();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    if (sweeping && hasSweep) {
+        char progBuf[48];
+        snprintf(progBuf, sizeof(progBuf), "%.2f MHz (#%u)", sweepSnap.currentScanFreqMHz, sweepSnap.sweepCount);
+        ImGui::ProgressBar(sweepSnap.progress, ImVec2(140.0f, 0.0f), progBuf);
+    } else {
+        ImGui::TextColored(ImVec4(0.6f, 0.65f, 0.7f, 1.0f), "Idle (Demod Active)");
+    }
+
+    // Band Presets Row
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Band Presets:");
+    auto applyBandPreset = [&](double startM, double stopM, DemodMode mode, float bwHz, double defaultTuneM) {
+        sweepStartMHz_ = startM;
+        sweepStopMHz_ = stopM;
+        SweepConfig sc = sweepEngine_.getConfig();
+        sc.startFreqMHz = startM;
+        sc.stopFreqMHz = stopM;
+        sc.dwellTimeMs = sweepDwellMs_;
+        sweepEngine_.configure(sc);
+
+        AmFmConfig ac = amFmDemod_.getConfig();
+        ac.mode = mode;
+        ac.bandwidthHz = bwHz;
+        ac.channelOffsetHz = 0.0;
+        amFmDemod_.setConfig(ac);
+        amFmDemod_.reset();
+
+        demodTargetFreqMHz_ = defaultTuneM;
+        if (!sweepEngine_.isActive()) {
+            tuneToFrequency(static_cast<uint32_t>(std::round(defaultTuneM * 1e6)));
+        }
+    };
+
+    ImGui::SameLine();
+    if (ImGui::Button("FM Broadcast (88-108)")) applyBandPreset(88.0, 108.0, DemodMode::WFM, 180000.0f, 98.0);
+    ImGui::SameLine();
+    if (ImGui::Button("Airband AM (118-137)"))  applyBandPreset(118.0, 137.0, DemodMode::AM, 10000.0f, 128.0);
+    ImGui::SameLine();
+    if (ImGui::Button("2m Ham NFM (144-148)"))  applyBandPreset(144.0, 148.0, DemodMode::NFM, 12500.0f, 145.5);
+    ImGui::SameLine();
+    if (ImGui::Button("70cm / ISM (430-440)"))  applyBandPreset(430.0, 440.0, DemodMode::NFM, 12500.0f, 433.92);
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Two-column layout: Left = AM/FM Demodulator, Right = Wideband Sweep & Waterfall
+    float availH = ImGui::GetContentRegionAvail().y;
+    ImGui::BeginChild("AmFmDemodPanel", ImVec2(315.0f, availH), true);
+
+    ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "AM / FM DEMODULATOR");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    AmFmConfig ac = amFmDemod_.getConfig();
+    AmFmStats as = amFmDemod_.getStats();
+
+    const char* modes[] = { "AM (Envelope)", "NFM (Narrowband FM)", "WFM (Wideband FM)" };
+    int curMode = static_cast<int>(ac.mode);
+    if (ImGui::Combo("Mode", &curMode, modes, IM_ARRAYSIZE(modes))) {
+        ac.mode = static_cast<DemodMode>(curMode);
+        if (ac.mode == DemodMode::AM)       ac.bandwidthHz = 10000.0f;
+        else if (ac.mode == DemodMode::NFM) ac.bandwidthHz = 12500.0f;
+        else                                ac.bandwidthHz = 180000.0f;
+        amFmDemod_.setConfig(ac);
+        amFmDemod_.reset();
+    }
+
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::InputDouble("Freq (MHz)##Demod", &demodTargetFreqMHz_, 0.025, 0.1, "%.4f");
+    ImGui::SameLine();
+    if (ImGui::Button("Tune")) {
+        sweepEngine_.stopSweep();
+        tuneToFrequency(static_cast<uint32_t>(std::round(demodTargetFreqMHz_ * 1e6)));
+    }
+
+    if (hasSweep && ImGui::Button("Tune to Sweep Peak", ImVec2(-1.0f, 0.0f))) {
+        sweepEngine_.stopSweep();
+        demodTargetFreqMHz_ = static_cast<double>(sweepSnap.peakFreqMHz);
+        tuneToFrequency(static_cast<uint32_t>(std::round(demodTargetFreqMHz_ * 1e6)));
+    }
+
+    float bwKhz = ac.bandwidthHz / 1000.0f;
+    if (ImGui::SliderFloat("IF BW (kHz)", &bwKhz, 2.0f, 240.0f, "%.1f kHz")) {
+        ac.bandwidthHz = bwKhz * 1000.0f;
+        amFmDemod_.setConfig(ac);
+    }
+
+    if (ImGui::SliderFloat("Squelch (dBFS)", &ac.squelchDbfs, -105.0f, 0.0f, "%.1f dB")) {
+        amFmDemod_.setConfig(ac);
+    }
+
+    if (ac.mode != DemodMode::AM) {
+        const char* deemphItems[] = { "Off", "50 us (EU / Intl)", "75 us (US)" };
+        int dIdx = (ac.deemphasisUs < 1.0f) ? 0 : (ac.deemphasisUs < 62.0f ? 1 : 2);
+        if (ImGui::Combo("De-emphasis", &dIdx, deemphItems, IM_ARRAYSIZE(deemphItems))) {
+            ac.deemphasisUs = (dIdx == 0) ? 0.0f : (dIdx == 1 ? 50.0f : 75.0f);
+            amFmDemod_.setConfig(ac);
+        }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Enable Audio Output", &ac.audioEnabled)) {
+        amFmDemod_.setConfig(ac);
+    }
+    if (ac.audioEnabled) {
+        if (ImGui::SliderFloat("Volume##AmFm", &ac.volume, 0.0f, 1.0f, "%.0f%%")) {
+            amFmDemod_.setConfig(ac);
+        }
+        if (sweeping) {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Audio paused during sweep");
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "SIGNAL & SQUELCH");
+
+    float rssiNorm = std::max(0.0f, std::min(1.0f, (as.signalRssiDbfs + 100.0f) / 100.0f));
+    char rssiBuf[48];
+    snprintf(rssiBuf, sizeof(rssiBuf), "%.1f dBFS", as.signalRssiDbfs);
+    ImGui::ProgressBar(rssiNorm, ImVec2(-1.0f, 0.0f), rssiBuf);
+
+    if (as.squelchOpen) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "● SQUELCH OPEN (RX)");
+    } else {
+        ImGui::TextColored(ImVec4(0.7f, 0.4f, 0.4f, 1.0f), "○ SQUELCH MUTED");
+    }
+
+    // Live AF Audio Oscilloscope
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "AF AUDIO SCOPE");
+    std::vector<float> afWave;
+    amFmDemod_.getWaveform(afWave);
+    float scopeH = ImGui::GetContentRegionAvail().y;
+    if (scopeH > 80.0f && ImPlot::BeginPlot("##AfAudioScope", ImVec2(-1.0f, scopeH), ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
+        ImPlot::SetupAxesLimits(0.0, static_cast<double>(afWave.size()), -1.05, 1.05, ImPlotCond_Always);
+        if (!afWave.empty()) {
+            ImPlotSpec afSpec;
+            afSpec.LineColor = ImVec4(0.2f, 1.0f, 0.55f, 1.0f);
+            afSpec.LineWeight = 1.5f;
+            ImPlot::PlotLine("AF", afWave.data(), static_cast<int>(afWave.size()), 1.0, 0.0, afSpec);
+        }
+        ImPlot::EndPlot();
+    }
+
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    // Right Column: Wideband Stitched Spectrum + Stitched Waterfall
+    ImGui::BeginChild("AmFmSweepPlots", ImVec2(0.0f, availH), false);
+    float rightW = ImGui::GetContentRegionAvail().x;
+    float rightH = ImGui::GetContentRegionAvail().y;
+
+    float plotH = rightH * 0.52f;
+    if (ImPlot::BeginPlot("##WidebandSweepSpectrum", ImVec2(rightW, plotH))) {
+        ImPlot::SetupAxes("Frequency (MHz)", "Power (dBFS)");
+
+        if (hasSweep && !sweepSnap.frequenciesMHz.empty()) {
+            double startF = sweepSnap.frequenciesMHz.front();
+            double endF = sweepSnap.frequenciesMHz.back();
+            ImPlot::SetupAxesLimits(startF, endF, -110.0, 0.0, ImPlotCond_Always);
+
+            std::vector<double> xs(sweepSnap.frequenciesMHz.begin(), sweepSnap.frequenciesMHz.end());
+            std::vector<double> curY(sweepSnap.currentDbfs.begin(), sweepSnap.currentDbfs.end());
+            std::vector<double> maxY(sweepSnap.maxHoldDbfs.begin(), sweepSnap.maxHoldDbfs.end());
+
+            ImPlotSpec maxSpec;
+            maxSpec.LineColor = ImVec4(0.2f, 0.8f, 0.9f, 0.6f);
+            maxSpec.LineWeight = 1.0f;
+            ImPlot::PlotLine("Max Hold", xs.data(), maxY.data(), static_cast<int>(xs.size()), maxSpec);
+
+            ImPlotSpec fillSpec;
+            fillSpec.FillColor = ImVec4(1.0f, 0.85f, 0.1f, 0.25f);
+            ImPlot::PlotShaded("##SweepFill", xs.data(), curY.data(), static_cast<int>(xs.size()), -120.0, fillSpec);
+
+            ImPlotSpec liveSpec;
+            liveSpec.LineColor = ImVec4(1.0f, 0.85f, 0.1f, 1.0f);
+            liveSpec.LineWeight = 1.6f;
+            ImPlot::PlotLine("Sweep Trace", xs.data(), curY.data(), static_cast<int>(xs.size()), liveSpec);
+
+            // Tuned Demodulator cursor
+            double tunedF = demodTargetFreqMHz_;
+            ImPlotSpec cSpec;
+            cSpec.LineColor = ImVec4(0.95f, 0.2f, 0.2f, 0.95f);
+            cSpec.LineWeight = 2.0f;
+            ImPlot::PlotInfLines("Tuned", &tunedF, 1, cSpec);
+
+            // Peak readout
+            char peakBuf[64];
+            snprintf(peakBuf, sizeof(peakBuf), "Peak: %.3f MHz (%.1f dBFS)", sweepSnap.peakFreqMHz, sweepSnap.peakDbfs);
+            ImPlotSpec pSpec;
+            pSpec.LineColor = ImVec4(1.0f, 0.95f, 0.3f, 1.0f);
+            ImPlot::PlotText(peakBuf, sweepSnap.peakFreqMHz, sweepSnap.peakDbfs + 6.0, ImVec2(0, 0), pSpec);
+
+            // Click on spectrum to tune demodulator directly
+            if (ImPlot::IsPlotHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                ImPlotPoint pt = ImPlot::GetPlotMousePos();
+                if (pt.x >= startF && pt.x <= endF) {
+                    sweepEngine_.stopSweep();
+                    demodTargetFreqMHz_ = pt.x;
+                    tuneToFrequency(static_cast<uint32_t>(std::round(pt.x * 1e6)));
+                }
+            }
+        }
+
+        ImPlot::EndPlot();
+    }
+
+    ImGui::Spacing();
+
+    // Wideband Stitched Waterfall
+    float wfH = ImGui::GetContentRegionAvail().y - 34.0f;
+    size_t swW = sweepEngine_.getWaterfallWidth();
+    size_t swH = sweepEngine_.getWaterfallHeight();
+    const auto& swPixels = sweepEngine_.getWaterfallPixels();
+
+    if (swW > 0 && swH > 0 && !swPixels.empty()) {
+        if (sweepWaterfallTextureId_ == 0) {
+            glGenTextures(1, &sweepWaterfallTextureId_);
+            glBindTexture(GL_TEXTURE_2D, sweepWaterfallTextureId_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<int>(swW), static_cast<int>(swH), 0, GL_RGBA, GL_UNSIGNED_BYTE, swPixels.data());
+            sweepWaterfallTexWidth_ = swW;
+            sweepWaterfallTexHeight_ = swH;
+        } else if (sweepWaterfallTexWidth_ != swW || sweepWaterfallTexHeight_ != swH) {
+            glBindTexture(GL_TEXTURE_2D, sweepWaterfallTextureId_);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<int>(swW), static_cast<int>(swH), 0, GL_RGBA, GL_UNSIGNED_BYTE, swPixels.data());
+            sweepWaterfallTexWidth_ = swW;
+            sweepWaterfallTexHeight_ = swH;
+        } else if (sweepEngine_.isWaterfallDirty()) {
+            glBindTexture(GL_TEXTURE_2D, sweepWaterfallTextureId_);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<int>(swW), static_cast<int>(swH), GL_RGBA, GL_UNSIGNED_BYTE, swPixels.data());
+            sweepEngine_.clearWaterfallDirty();
+        }
+    }
+
+    if (sweepWaterfallTextureId_ != 0 && wfH > 20.0f) {
+        ImGui::Image(static_cast<ImTextureID>(sweepWaterfallTextureId_), ImVec2(rightW, wfH));
+    } else {
+        ImGui::Dummy(ImVec2(rightW, std::max(20.0f, wfH)));
+    }
+
+    const char* palettes[] = { "Turbo (Rainbow)", "Viridis", "Plasma", "Fire" };
+    ImGui::SetNextItemWidth(150.0f);
+    if (ImGui::Combo("Waterfall Palette##Sweep", &sweepPaletteIdx_, palettes, IM_ARRAYSIZE(palettes))) {
+        sweepEngine_.setWaterfallPalette(static_cast<WaterfallPalette>(sweepPaletteIdx_));
+    }
+    ImGui::SameLine(0.0f, 15.0f);
+    ImGui::TextDisabled("Tip: Click any signal on the sweep plot to stop sweeping & demodulate it.");
+
+    ImGui::EndChild();
 }
 
 void MainWindow::renderDiagnosticsTab() {

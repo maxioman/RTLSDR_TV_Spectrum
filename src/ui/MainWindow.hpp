@@ -5,7 +5,10 @@
 #include "sdr/RtlUsbDevice.hpp"
 #include "sdr/TestSignalGenerator.hpp"
 #include "dsp/SpectrumEngine.hpp"
+#include "dsp/SpectrumSweepEngine.hpp"
 #include "dsp/AnalogTvDemod.hpp"
+#include "dsp/AmFmDemod.hpp"
+#include "audio/AudioOutput.hpp"
 
 #include <memory>
 #include <string>
@@ -24,18 +27,23 @@ private:
     void renderTopBar();
     void renderAnalogTvTab();
     void renderSpectrumTab();
+    void renderAmFmSweepTab();
     void renderDiagnosticsTab();
 
     void handleSdrSamples(const uint8_t* data, size_t length);
     void connectDevice();
     void disconnectDevice();
     void tuneToFrequency(uint32_t freqHz);
+    void pumpAudio();
 
     // SDR Subsystem
     SdrConfig config_;
     std::unique_ptr<ISdrDevice> sdrDevice_;
     SpectrumEngine spectrumEngine_;
+    SpectrumSweepEngine sweepEngine_;
     AnalogTvDemod tvDemod_;
+    AmFmDemod amFmDemod_;
+    AudioOutput audioOutput_;
 
     // UI State
     int selectedSource_ = 0; // 0: rtl_tcp, 1: Local USB, 2: Test Gen
@@ -62,6 +70,17 @@ private:
     unsigned int waterfallTextureId_ = 0;
     size_t waterfallTexWidth_ = 0;
     size_t waterfallTexHeight_ = 0;
+
+    unsigned int sweepWaterfallTextureId_ = 0;
+    size_t sweepWaterfallTexWidth_ = 0;
+    size_t sweepWaterfallTexHeight_ = 0;
+
+    // AM/FM Sweep & Demodulator UI state
+    double sweepStartMHz_ = 88.0;
+    double sweepStopMHz_ = 108.0;
+    int sweepDwellMs_ = 65;
+    int sweepPaletteIdx_ = 0;
+    double demodTargetFreqMHz_ = 98.0;
 
     // Audio output
     bool audioDeviceOpened_ = false;
